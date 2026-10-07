@@ -11,6 +11,7 @@
 #include <pinocchio/algorithm/aba.hpp>
 #include <pinocchio/algorithm/compute-all-terms.hpp>
 #include <pinocchio/algorithm/frames.hpp>
+#include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/multibody/fwd.hpp>
 #include <pinocchio/parsers/urdf.hpp>
@@ -40,6 +41,59 @@
 
 namespace crisp_controllers {
 
+namespace {
+
+/// Mass and center of mass, in the frame `sensor_frame`, of everything mounted after it: the
+/// link at that frame, every fixed link below it, and every joint subtree hanging below it,
+/// with joints at their neutral position. Needs the FULL model: in a reduced one the locked
+/// subtrees are merged into joint inertias and the per-link frame inertias are gone.
+bool payload_from_model(
+  const pinocchio::Model & model, const std::string & sensor_frame, double & mass,
+  Eigen::Vector3d & com) {
+  if (!model.existFrame(sensor_frame, pinocchio::BODY)) {
+    return false;
+  }
+  const auto sensor_id = model.getFrameId(sensor_frame, pinocchio::BODY);
+  const auto parent_joint = model.frames[sensor_id].parentJoint;
+  // The URDF parser stores a fixed link's inertia on the FIXED_JOINT frame that attaches it,
+  // which is the BODY frame's parent; for the sensor link that frame is above the sensor.
+  const auto own_joint_frame = model.frames[sensor_id].parentFrame;
+  auto below_sensor = [&](pinocchio::FrameIndex f) {
+    while (f != 0) {
+      if (f == sensor_id) {
+        return true;
+      }
+      f = model.frames[f].parentFrame;
+    }
+    return false;
+  };
+
+  pinocchio::Data data(model);
+  pinocchio::framesForwardKinematics(model, data, pinocchio::neutral(model));
+  const pinocchio::SE3 sensor_M_world = data.oMf[sensor_id].inverse();
+
+  pinocchio::Inertia payload = pinocchio::Inertia::Zero();
+  for (pinocchio::FrameIndex f = 0; f < model.frames.size(); ++f) {
+    const auto & frame = model.frames[f];
+    if (
+      frame.type == pinocchio::FIXED_JOINT && frame.parentJoint == parent_joint &&
+      (f == own_joint_frame || below_sensor(f))) {
+      payload += (sensor_M_world * data.oMf[f]).act(frame.inertia);
+    } else if (
+      frame.type == pinocchio::JOINT && model.parents[frame.parentJoint] == parent_joint &&
+      below_sensor(f)) {
+      for (const auto j : model.subtrees[frame.parentJoint]) {
+        payload += (sensor_M_world * data.oMi[j]).act(model.inertias[j]);
+      }
+    }
+  }
+  mass = payload.mass();
+  com = payload.lever();
+  return true;
+}
+
+}  // namespace
+
 controller_interface::InterfaceConfiguration
 CartesianAdmittanceController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
@@ -60,6 +114,12 @@ CartesianAdmittanceController::state_interface_configuration() const {
   }
   for (const auto & joint_name : params_.joints) {
     config.names.push_back(joint_name + "/velocity");
+  }
+  // F/T sensor last, so the joint indexing in updateCurrentState() is untouched.
+  if (!ft_state_sensor_name_.empty()) {
+    for (const auto * axis : {"force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"}) {
+      config.names.push_back(ft_state_sensor_name_ + "/" + axis);
+    }
   }
   return config;
 }
@@ -89,8 +149,10 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
     setStiffnessAndDamping();
   }
 
-  // 3. Parse F/T sensor data
-  if (new_ft_sensor_) {
+  // 3. Parse F/T sensor data (state interfaces if ft_sensor.name is set, topic otherwise)
+  if (!ft_state_sensor_name_.empty()) {
+    read_ft_sensor_state_();
+  } else if (new_ft_sensor_) {
     parse_ft_sensor_();
     new_ft_sensor_ = false;
   }
@@ -156,9 +218,12 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
   Eigen::Vector<double, 6> adm_error;
   adm_error << adm_pos_error, adm_rot_error;
 
-  // 9. Transform F/T wrench from sensor (LOCAL) frame to LOCAL_WORLD_ALIGNED frame
+  // 9. Remove payload weight and tare, then transform F/T wrench from sensor (LOCAL)
+  // frame to LOCAL_WORLD_ALIGNED frame
   pinocchio::SE3 ft_sensor_pose = data_.oMf[ft_sensor_frame_id];
-  pinocchio::Force ft_local(ft_wrench_.head(3), ft_wrench_.tail(3));
+  const Eigen::Vector<double, 6> ft_compensated =
+    compensate_ft_wrench_(ft_sensor_pose.rotation(), period.seconds());
+  pinocchio::Force ft_local(ft_compensated.head<3>(), ft_compensated.tail<3>());
   pinocchio::Force ft_world = pinocchio::Force::Zero();
   pinocchio::changeReferenceFrame(
     ft_sensor_pose, ft_local, pinocchio::LOCAL, pinocchio::LOCAL_WORLD_ALIGNED, ft_world);
@@ -426,6 +491,28 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
       params_.ft_sensor.frame.c_str(),
       ft_sensor_frame_id);
   }
+
+  payload_mass_ = 0.0;
+  payload_com_.setZero();
+  if (params_.ft_sensor.payload_compensation) {
+    if (params_.ft_sensor.payload.from_model) {
+      const auto & sensor_frame = model_.frames[ft_sensor_frame_id].name;
+      if (!payload_from_model(raw_model_, sensor_frame, payload_mass_, payload_com_)) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+          "ft_sensor.payload.from_model: '%s' is not a link in the robot description.",
+          sensor_frame.c_str());
+        return CallbackReturn::ERROR;
+      }
+    } else {
+      payload_mass_ = params_.ft_sensor.payload.mass;
+      payload_com_ << params_.ft_sensor.payload.com[0], params_.ft_sensor.payload.com[1],
+        params_.ft_sensor.payload.com[2];
+    }
+    RCLCPP_INFO(get_node()->get_logger(),
+      "F/T payload compensation (%s): mass %.4f kg, com [%.5f, %.5f, %.5f] m, tare %.2f s",
+      params_.ft_sensor.payload.from_model ? "robot model" : "parameters", payload_mass_,
+      payload_com_.x(), payload_com_.y(), payload_com_.z(), params_.ft_sensor.tare_duration);
+  }
   q = Eigen::VectorXd::Zero(model_.nv);
   q_pin = Eigen::VectorXd::Zero(model_.nq);
   dq = Eigen::VectorXd::Zero(model_.nv);
@@ -554,18 +641,25 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
 
   // --- Admittance-specific subscriptions ---
 
-  // F/T sensor subscription
-  auto ft_sensor_callback =
-    [this](const std::shared_ptr<geometry_msgs::msg::WrenchStamped> msg) -> void {
-    ft_sensor_buffer_.writeFromNonRT(msg);
-    new_ft_sensor_ = true;
-  };
+  // F/T sensor: state interfaces if ft_sensor.name is set, topic subscription otherwise
+  ft_state_sensor_name_ = params_.ft_sensor.name;
+  ft_sensor_sub_.reset();
+  if (!ft_state_sensor_name_.empty()) {
+    RCLCPP_INFO(get_node()->get_logger(), "F/T sensor read from state interfaces: %s/{force,torque}.*",
+      params_.ft_sensor.name.c_str());
+  } else {
+    auto ft_sensor_callback =
+      [this](const std::shared_ptr<geometry_msgs::msg::WrenchStamped> msg) -> void {
+      ft_sensor_buffer_.writeFromNonRT(msg);
+      new_ft_sensor_ = true;
+    };
 
-  ft_sensor_sub_ = get_node()->create_subscription<geometry_msgs::msg::WrenchStamped>(
-    params_.ft_sensor.topic, rclcpp::SensorDataQoS(), ft_sensor_callback);
+    ft_sensor_sub_ = get_node()->create_subscription<geometry_msgs::msg::WrenchStamped>(
+      params_.ft_sensor.topic, rclcpp::SensorDataQoS(), ft_sensor_callback);
 
-  RCLCPP_INFO(get_node()->get_logger(), "F/T sensor subscription on topic: %s",
-    params_.ft_sensor.topic.c_str());
+    RCLCPP_INFO(get_node()->get_logger(), "F/T sensor subscription on topic: %s",
+      params_.ft_sensor.topic.c_str());
+  }
 
   // Variable admittance stiffness subscription
   if (params_.variable_admittance_stiffness.enabled) {
@@ -776,6 +870,23 @@ void CartesianAdmittanceController::updateCurrentState(bool initialize) {
 CallbackReturn
 CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*previous_state*/) {
 
+  // update() reads the wrench positionally after the joint interfaces; check by name first.
+  if (!ft_state_sensor_name_.empty()) {
+    const size_t offset = 2 * params_.joints.size();
+    size_t i = 0;
+    for (const auto * axis : {"force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"}) {
+      const std::string want = ft_state_sensor_name_ + "/" + axis;
+      if (offset + i >= state_interfaces_.size() ||
+          state_interfaces_[offset + i].get_name() != want) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+          "Expected state interface '%s' at index %zu; refusing to activate.", want.c_str(),
+          offset + i);
+        return CallbackReturn::ERROR;
+      }
+      ++i;
+    }
+  }
+
   // Update the current state with initial measurements (no EMA filtering)
   updateCurrentState(true);
 
@@ -793,6 +904,8 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
   admittance_initialized_ = false;
   inner_motion_.setZero();
   ft_wrench_.setZero();
+  ft_wrench_valid_ = false;
+  reset_ft_tare_();
 
   RCLCPP_INFO(get_node()->get_logger(), "Admittance controller activated.");
   return CallbackReturn::SUCCESS;
@@ -875,6 +988,81 @@ void CartesianAdmittanceController::parse_ft_sensor_() {
   auto msg = *ft_sensor_buffer_.readFromRT();
   ft_wrench_ << msg->wrench.force.x, msg->wrench.force.y, msg->wrench.force.z,
     msg->wrench.torque.x, msg->wrench.torque.y, msg->wrench.torque.z;
+  ft_wrench_valid_ = ft_wrench_.allFinite();
+}
+
+bool CartesianAdmittanceController::read_ft_sensor_state_() {
+  // The wrench interfaces follow the joint positions and velocities.
+  const size_t offset = 2 * params_.joints.size();
+  for (size_t i = 0; i < 6; ++i) {
+#if ROS2_VERSION_ABOVE_HUMBLE
+    const auto value = state_interfaces_[offset + i].get_optional();
+    const bool valid = value.has_value() && std::isfinite(value.value());
+    const double v = valid ? value.value() : 0.0;
+#else
+    const double v = state_interfaces_[offset + i].get_value();
+    const bool valid = std::isfinite(v);
+#endif
+    if (!valid) {
+      // A missing or NaN wrench (sensor still starting, dropout, mock hardware)
+      // would be integrated into the admittance state; treat it as no contact.
+      ft_wrench_.setZero();
+      ft_wrench_valid_ = false;
+      RCLCPP_WARN_THROTTLE(
+        get_node()->get_logger(), *get_node()->get_clock(), 1000,
+        "Missing or non-finite value on %s; using zero F/T wrench.",
+        state_interfaces_[offset + i].get_name().c_str());
+      return false;
+    }
+    ft_wrench_[i] = v;
+  }
+  ft_wrench_valid_ = true;
+  return true;
+}
+
+Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
+  const Eigen::Matrix3d & ft_sensor_rotation, double dt) {
+  if (!ft_wrench_valid_) {
+    return Eigen::Vector<double, 6>::Zero();
+  }
+  Eigen::Vector<double, 6> wrench = ft_wrench_;
+
+  // The sensor reads the force the payload exerts ON it, which is its weight,
+  // plus the torque of that weight about the sensor origin.
+  if (payload_mass_ > 0.0) {
+    const Eigen::Vector3d f_weight =
+      payload_mass_ * (ft_sensor_rotation.transpose() * model_.gravity.linear());
+    wrench.head<3>() -= f_weight;
+    wrench.tail<3>() -= payload_com_.cross(f_weight);
+  }
+
+  if (!ft_tare_done_) {
+    // Average what is left at rest; hold the admittance still meanwhile.
+    ft_tare_sum_ += wrench;
+    ++ft_tare_count_;
+    ft_tare_elapsed_ += dt;
+    if (ft_tare_elapsed_ < params_.ft_sensor.tare_duration) {
+      return Eigen::Vector<double, 6>::Zero();
+    }
+    ft_tare_offset_ = ft_tare_sum_ / static_cast<double>(ft_tare_count_);
+    ft_tare_done_ = true;
+    RCLCPP_INFO(get_node()->get_logger(),
+      "F/T tare over %.2f s (%zu samples): force [%.3f, %.3f, %.3f] N, "
+      "torque [%.4f, %.4f, %.4f] Nm",
+      ft_tare_elapsed_, ft_tare_count_,
+      ft_tare_offset_[0], ft_tare_offset_[1], ft_tare_offset_[2],
+      ft_tare_offset_[3], ft_tare_offset_[4], ft_tare_offset_[5]);
+  }
+
+  return wrench - ft_tare_offset_;
+}
+
+void CartesianAdmittanceController::reset_ft_tare_() {
+  ft_tare_offset_.setZero();
+  ft_tare_sum_.setZero();
+  ft_tare_count_ = 0;
+  ft_tare_elapsed_ = 0.0;
+  ft_tare_done_ = params_.ft_sensor.tare_duration <= 0.0;
 }
 
 void CartesianAdmittanceController::parse_target_adm_stiffness_() {

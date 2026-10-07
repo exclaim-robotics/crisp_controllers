@@ -166,6 +166,17 @@ private:
    * @brief Reads the F/T sensor data from the realtime buffer and updates the internal wrench
    */
   void parse_ft_sensor_();
+  /** @brief Read the F/T wrench from the claimed sensor state interfaces.
+   *  @return false if a value is missing or non-finite (ft_wrench_ is then zeroed) */
+  bool read_ft_sensor_state_();
+  /** @brief Subtract the payload weight and the software tare from ft_wrench_.
+   *  @param ft_sensor_rotation Rotation of the F/T sensor frame in the world frame
+   *  @param dt Cycle period [s], for the tare window
+   *  @return Sensor-frame wrench for the admittance (zero while invalid or taring) */
+  Eigen::Vector<double, 6> compensate_ft_wrench_(
+    const Eigen::Matrix3d & ft_sensor_rotation, double dt);
+  /** @brief Restart the software tare (on activation) */
+  void reset_ft_tare_();
 
   /**
    * @brief Reads the target admittance stiffness from the realtime buffer
@@ -261,6 +272,27 @@ private:
   Eigen::Matrix<double, 6, 6> adm_damping_;
   /** @brief F/T sensor reading (6D wrench) */
   Eigen::VectorXd ft_wrench_;
+  /** @brief F/T sensor component whose state interfaces are read, fixed at configure (empty:
+   *  topic). params_ is refreshed in update(), so it must not decide what was claimed. */
+  std::string ft_state_sensor_name_;
+  /** @brief True while ft_wrench_ holds a real measurement (false before the first one or
+   *  after a missing/non-finite sample); compensating a placeholder zero would leave
+   *  the negated payload weight as a phantom push */
+  bool ft_wrench_valid_ = false;
+  /** @brief Payload mass after the F/T sensor [kg], fixed at configure */
+  double payload_mass_ = 0.0;
+  /** @brief Payload center of mass in the F/T sensor frame [m] */
+  Eigen::Vector3d payload_com_ = Eigen::Vector3d::Zero();
+  /** @brief Constant offset subtracted from the compensated wrench (software tare) */
+  Eigen::Vector<double, 6> ft_tare_offset_ = Eigen::Vector<double, 6>::Zero();
+  /** @brief Running sum of the compensated wrench during the tare window */
+  Eigen::Vector<double, 6> ft_tare_sum_ = Eigen::Vector<double, 6>::Zero();
+  /** @brief Samples in ft_tare_sum_ */
+  size_t ft_tare_count_ = 0;
+  /** @brief Time spent in the tare window so far [s] */
+  double ft_tare_elapsed_ = 0.0;
+  /** @brief True once the tare window has closed (or the tare is disabled) */
+  bool ft_tare_done_ = true;
   /** @brief Topic-provided admittance stiffness (6x6 diagonal) */
   Eigen::Matrix<double, 6, 6> topic_adm_stiffness_;
 

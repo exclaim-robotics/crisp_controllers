@@ -472,6 +472,10 @@ cartesian_admittance_controller:
         bounds<>: [0.0, 5000.0]
 
   ft_sensor:
+    name:
+      type: string
+      default_value: ""
+      description: "Name of the F/T sensor component exporting <name>/force.{x,y,z} and <name>/torque.{x,y,z} state interfaces. If set, the wrench is read from these state interfaces and ft_sensor.topic is ignored. If empty, the wrench is read from ft_sensor.topic."
     topic:
       type: string
       default_value: "ft_sensor_wrench"
@@ -480,6 +484,33 @@ cartesian_admittance_controller:
       type: string
       default_value: ""
       description: "Name of the F/T sensor measurement frame in the URDF. If empty, defaults to end_effector_frame (legacy behavior)."
+    payload_compensation:
+      type: bool
+      default_value: false
+      description: "Subtract the payload's weight (everything mounted after ft_sensor.frame) from the measured wrench, using the sensor orientation from the robot model, so it is not taken for an external push. Gravity is the robot model's."
+    payload:
+      from_model:
+        type: bool
+        default_value: true
+        description: "Take the payload mass and center of mass from the robot description: every link after ft_sensor.frame, including that link and any joints below it (held at their neutral position). If false, use ft_sensor.payload.mass and ft_sensor.payload.com."
+      mass:
+        type: double
+        default_value: 0.0
+        description: "Payload mass [kg], used when ft_sensor.payload.from_model is false."
+        validation:
+          gt_eq<>: [0.0]
+      com:
+        type: double_array
+        default_value: [0.0, 0.0, 0.0]
+        description: "Payload center of mass [m] in ft_sensor.frame, used when ft_sensor.payload.from_model is false."
+        validation:
+          fixed_size<>: [3]
+    tare_duration:
+      type: double
+      default_value: 0.0
+      description: "Seconds over which the (payload-compensated) wrench is averaged after activation and then subtracted as a constant offset. Removes sensor bias, and the weight a sensor driver tared away at its own start-up. The admittance sees zero wrench during this window, so keep the robot untouched. 0 disables the software tare."
+      validation:
+        gt_eq<>: [0.0]
 
   variable_max_admittance_stiffness:
     translational:
