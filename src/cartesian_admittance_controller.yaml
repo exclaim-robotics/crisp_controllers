@@ -319,6 +319,12 @@ cartesian_admittance_controller:
     description: "If set to true, we will stop sending commands to the robot. This is mainly for debugging useful."
 
   friction:
+    source:
+      type: string
+      default_value: "measured"
+      description: "Joint velocity the friction model is evaluated at. measured: the joints' own velocity (feedback; zero for a joint that is stuck, so no help breaking it loose). target: the admittance target's velocity mapped to the joints through the Jacobian pseudo-inverse (feedforward; helps a joint in the direction it is about to move, and is zero while the target is still). target needs the default decoupled integration (coupled_se3_integration false), and falls back to measured otherwise."
+      validation:
+        one_of<>: [["measured", "target"]]
     fp1:
       type: double_array
       default_value: [0.54615, 0.87224, 0.64068, 1.2794, 0.83904, 0.30301, 0.56489]
@@ -331,6 +337,16 @@ cartesian_admittance_controller:
       type: double_array
       default_value: [ 0.039533, 0.025882, -0.04607, 0.036194, 0.026226, -0.021047, 0.0035526]
       description: "Friction parameters part 3"
+    coulomb:
+      type: double_array
+      default_value: []
+      description: "Optional Coulomb term per joint [Nm], added to the fp1-fp3 model: coulomb * tanh(dq / velocity_threshold), at the same joint velocity (see source). Covers the static/breakaway friction the smooth fp model barely reaches at low speed. Empty = none; otherwise one value per joint. Meant for source 'target': on the measured velocity a sharp term chatters as a stuck joint jitters around zero."
+    velocity_threshold:
+      type: double
+      default_value: 0.02
+      description: "Joint velocity [rad/s] over which the Coulomb term ramps in (tanh scale): 76% of it at this velocity."
+      validation:
+        gt<>: [0.0]
 
   variable_max_impedance_stiffness:
     translational:
@@ -362,6 +378,18 @@ cartesian_admittance_controller:
     description: "Whether or not to enable introspection for this controller. This will allow us to visualize the internal state of the controller in plotjuggler using the introspection topics."
 
   admittance:
+    max_lag_position:
+      type: double
+      default_value: 0.0
+      description: "Leash [m]: the admittance target is kept within this distance of the end effector, and its velocity away from it removed. Bounds how far the arm travels after a push is released (it catches up with the target) and stops a hard push winding the target up far ahead of an arm that cannot follow. While it binds, the target's speed away from the arm is capped at the arm's own speed (not zeroed), so friction.source target keeps compensating at the speed the arm actually moves. 0 disables. Pair with task.error_clip of the same size and a stiffness that still gives enough pull at that lag."
+      validation:
+        gt_eq<>: [0.0]
+    max_lag_rotation:
+      type: double
+      default_value: 0.0
+      description: "Leash [rad], as max_lag_position for the orientation. 0 disables."
+      validation:
+        gt_eq<>: [0.0]
     mass_x:
       type: double
       default_value: 1.0
@@ -509,6 +537,30 @@ cartesian_admittance_controller:
       type: double
       default_value: 0.0
       description: "Seconds over which the (payload-compensated) wrench is averaged after activation and then subtracted as a constant offset. Removes sensor bias, and the weight a sensor driver tared away at its own start-up. The admittance sees zero wrench during this window, so keep the robot untouched. 0 disables the software tare."
+      validation:
+        gt_eq<>: [0.0]
+    deadzone_force:
+      type: double
+      default_value: 0.0
+      description: "Force deadzone [N], applied after payload compensation and tare: the force magnitude is reduced by this much (direction kept), so smaller forces are ignored and the output is continuous at the edge. Covers sensor drift since the tare and payload model error, which would otherwise drive the admittance target forever when its stiffness is zero. 0 disables."
+      validation:
+        gt_eq<>: [0.0]
+    deadzone_torque:
+      type: double
+      default_value: 0.0
+      description: "Torque deadzone [Nm], as deadzone_force for the torque. 0 disables."
+      validation:
+        gt_eq<>: [0.0]
+    max_force:
+      type: double
+      default_value: 0.0
+      description: "Ceiling [N] on the force driving the admittance, after the deadzone: larger pushes are capped (direction kept), so the target moves at most max_force / admittance damping. 0 disables."
+      validation:
+        gt_eq<>: [0.0]
+    max_torque:
+      type: double
+      default_value: 0.0
+      description: "Ceiling [Nm], as max_force for the torque. 0 disables."
       validation:
         gt_eq<>: [0.0]
 
