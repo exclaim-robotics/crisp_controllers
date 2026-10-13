@@ -264,6 +264,10 @@ private:
   Eigen::Vector<double, 6> inner_motion_;
   /** @brief First-cycle initialization flag for admittance state */
   bool admittance_initialized_;
+  /** @brief Seconds the admittance wrench has been zero (admittance.release_brake) */
+  double release_quiet_time_ = 0.0;
+  /** @brief True once the brake has acted for the current release (or before any push) */
+  bool release_braked_ = true;
   /** @brief Admittance virtual mass matrix (6x6 diagonal) */
   Eigen::Matrix<double, 6, 6> adm_mass_;
   /** @brief Inverse of admittance virtual mass matrix */

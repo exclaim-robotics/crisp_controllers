@@ -229,6 +229,22 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
     ft_sensor_pose, ft_local, pinocchio::LOCAL, pinocchio::LOCAL_WORLD_ALIGNED, ft_world);
   Eigen::Vector<double, 6> ft_wrench_world = ft_world.toVector();
 
+  // 9b. Release brake: the wrench is exactly zero inside the deadzone, so zero for hold_off
+  // means the push has ended. Stop the target there instead of letting it coast for
+  // mass / damping, once per release so an admittance spring can still move it after.
+  if (params_.admittance.release_brake.enabled) {
+    if (ft_compensated.cwiseAbs().maxCoeff() > 0.0) {
+      release_quiet_time_ = 0.0;
+      release_braked_ = false;
+    } else {
+      release_quiet_time_ += period.seconds();
+      if (!release_braked_ && release_quiet_time_ >= params_.admittance.release_brake.hold_off) {
+        inner_motion_.setZero();
+        release_braked_ = true;
+      }
+    }
+  }
+
   // 10. Admittance dynamics: accel = M_inv * (F_ext - D * vel + K * error)
   // Spring term +K*(desired - inner) is a restoring force toward the desired pose
   Eigen::Matrix<double, 6, 6> K_adm = use_topic_adm_stiffness_ ? topic_adm_stiffness_ : adm_stiffness_;
@@ -1029,6 +1045,8 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
   // Reset admittance state so it reinitializes on first update cycle
   admittance_initialized_ = false;
   inner_motion_.setZero();
+  release_quiet_time_ = 0.0;
+  release_braked_ = true;
   ft_wrench_.setZero();
   ft_wrench_valid_ = false;
   reset_ft_tare_();

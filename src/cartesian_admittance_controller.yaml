@@ -390,6 +390,17 @@ cartesian_admittance_controller:
       description: "Leash [rad], as max_lag_position for the orientation. 0 disables."
       validation:
         gt_eq<>: [0.0]
+    release_brake:
+      enabled:
+        type: bool
+        default_value: false
+        description: "Stop the admittance target the moment a push is released: once the F/T wrench handed to the admittance (after deadzone) has been zero for release_brake.hold_off, its velocity is set to zero, once per release. Removes the coast (mass / damping) and with it the friction feedforward that follows the target; the arm still closes the gap to the target, at most the leash. An admittance spring moves the target as usual afterwards."
+      hold_off:
+        type: double
+        default_value: 0.02
+        description: "Seconds the wrench must stay zero before the brake acts, so a push hovering at the deadzone edge does not stop the target every few cycles."
+        validation:
+          gt_eq<>: [0.0]
     mass_x:
       type: double
       default_value: 1.0
