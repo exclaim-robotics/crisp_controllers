@@ -285,6 +285,13 @@ private:
   double payload_mass_ = 0.0;
   /** @brief Payload center of mass in the F/T sensor frame [m] */
   Eigen::Vector3d payload_com_ = Eigen::Vector3d::Zero();
+  /** @brief Payload weight force = this * gravity in the sensor frame (mass * I unless
+   *  ft_sensor.force_calibration.matrix is set), fixed at configure */
+  Eigen::Matrix3d payload_force_matrix_ = Eigen::Matrix3d::Zero();
+  /** @brief Index in params_.joints of ft_sensor.force_calibration.joint, -1 if none */
+  int ft_harmonics_joint_ = -1;
+  /** @brief ft_sensor.force_calibration.harmonics, one 3x2 [c s] block per harmonic */
+  std::vector<Eigen::Matrix<double, 3, 2>> ft_harmonics_;
   /** @brief Constant offset subtracted from the compensated wrench (software tare) */
   Eigen::Vector<double, 6> ft_tare_offset_ = Eigen::Vector<double, 6>::Zero();
   /** @brief Last wrench handed to the admittance (sensor frame), for introspection */

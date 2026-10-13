@@ -533,6 +533,19 @@ cartesian_admittance_controller:
         description: "Payload center of mass [m] in ft_sensor.frame, used when ft_sensor.payload.from_model is false."
         validation:
           fixed_size<>: [3]
+    force_calibration:
+      matrix:
+        type: double_array
+        default_value: []
+        description: "Empty, or 9 values (row-major 3x3, kg): the payload's weight FORCE as the sensor reports it is matrix * g, g being gravity in ft_sensor.frame [m/s^2], in place of payload mass * g. Fitted from still poses, it takes in the sensor's gain and cross-axis errors and a misalignment between its axes and ft_sensor.frame. The weight's torque still uses payload mass and com. Needs payload_compensation."
+      joint:
+        type: string
+        default_value: ""
+        description: "Joint whose angle q the harmonics below depend on (one of joints). Empty disables them."
+      harmonics:
+        type: double_array
+        default_value: []
+        description: "6 values per harmonic k = 1, 2, ...: [cx, cy, cz, sx, sy, sz] [N]. c_k cos(k q) + s_k sin(k q) is subtracted from the measured force in ft_sensor.frame: a force on the sensor that depends on that joint's angle and not on gravity."
     tare_duration:
       type: double
       default_value: 0.0

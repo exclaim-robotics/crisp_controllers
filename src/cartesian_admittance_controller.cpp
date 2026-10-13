@@ -580,6 +580,46 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
       params_.ft_sensor.payload.from_model ? "robot model" : "parameters", payload_mass_,
       payload_com_.x(), payload_com_.y(), payload_com_.z(), params_.ft_sensor.tare_duration);
   }
+
+  // Force calibration: a full 3x3 weight matrix and joint-angle harmonics in place of
+  // mass * I. Checked here because the parameter library cannot express the sizes.
+  const auto & cal = params_.ft_sensor.force_calibration;
+  payload_force_matrix_ = payload_mass_ * Eigen::Matrix3d::Identity();
+  if (!cal.matrix.empty()) {
+    if (cal.matrix.size() != 9 || !params_.ft_sensor.payload_compensation) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "ft_sensor.force_calibration.matrix needs 9 values (has %zu) and payload_compensation.",
+        cal.matrix.size());
+      return CallbackReturn::ERROR;
+    }
+    payload_force_matrix_ = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(
+      cal.matrix.data());
+  }
+  ft_harmonics_joint_ = -1;
+  ft_harmonics_.clear();
+  if (!cal.joint.empty()) {
+    const auto it = std::find(params_.joints.begin(), params_.joints.end(), cal.joint);
+    if (it == params_.joints.end() || cal.harmonics.empty() || cal.harmonics.size() % 6 != 0) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "ft_sensor.force_calibration: joint '%s' must be one of joints, and harmonics a "
+        "non-empty multiple of 6 values (has %zu).", cal.joint.c_str(), cal.harmonics.size());
+      return CallbackReturn::ERROR;
+    }
+    ft_harmonics_joint_ = static_cast<int>(std::distance(params_.joints.begin(), it));
+    for (size_t k = 0; k < cal.harmonics.size(); k += 6) {
+      Eigen::Matrix<double, 3, 2> block;
+      block << cal.harmonics[k], cal.harmonics[k + 3],
+        cal.harmonics[k + 1], cal.harmonics[k + 4],
+        cal.harmonics[k + 2], cal.harmonics[k + 5];
+      ft_harmonics_.push_back(block);
+    }
+  }
+  if (!cal.matrix.empty() || ft_harmonics_joint_ >= 0) {
+    RCLCPP_INFO(get_node()->get_logger(),
+      "F/T force calibration: %s matrix, %zu harmonic(s) of %s",
+      cal.matrix.empty() ? "no" : "3x3", ft_harmonics_.size(),
+      ft_harmonics_joint_ >= 0 ? cal.joint.c_str() : "no joint");
+  }
   q = Eigen::VectorXd::Zero(model_.nv);
   q_pin = Eigen::VectorXd::Zero(model_.nq);
   dq = Eigen::VectorXd::Zero(model_.nv);
@@ -1116,10 +1156,19 @@ Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
   // The sensor reads the force the payload exerts ON it, which is its weight,
   // plus the torque of that weight about the sensor origin.
   if (payload_mass_ > 0.0) {
-    const Eigen::Vector3d f_weight =
-      payload_mass_ * (ft_sensor_rotation.transpose() * model_.gravity.linear());
-    wrench.head<3>() -= f_weight;
+    const Eigen::Vector3d g_sensor = ft_sensor_rotation.transpose() * model_.gravity.linear();
+    const Eigen::Vector3d f_weight = payload_mass_ * g_sensor;
+    // The force as the sensor reports it (force_calibration.matrix, mass * I if unset);
+    // the torque keeps the rigid weight about the com.
+    wrench.head<3>() -= payload_force_matrix_ * g_sensor;
     wrench.tail<3>() -= payload_com_.cross(f_weight);
+  }
+  if (ft_harmonics_joint_ >= 0) {
+    const double qj = q[ft_harmonics_joint_];
+    for (size_t k = 0; k < ft_harmonics_.size(); ++k) {
+      const double a = static_cast<double>(k + 1) * qj;
+      wrench.head<3>() -= ft_harmonics_[k] * Eigen::Vector2d(std::cos(a), std::sin(a));
+    }
   }
 
   if (!ft_tare_done_) {
