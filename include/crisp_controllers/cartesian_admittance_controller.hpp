@@ -169,7 +169,9 @@ private:
   /** @brief Read the F/T wrench from the claimed sensor state interfaces.
    *  @return false if a value is missing or non-finite (ft_wrench_ is then zeroed) */
   bool read_ft_sensor_state_();
-  /** @brief Subtract the payload weight and the software tare from ft_wrench_.
+  /** @brief Subtract the payload weight and the software tare from ft_wrench_, then apply
+   *  the force and torque deadzones (ft_sensor.deadzone_force / deadzone_torque) and
+   *  ceilings (ft_sensor.max_force / max_torque).
    *  @param ft_sensor_rotation Rotation of the F/T sensor frame in the world frame
    *  @param dt Cycle period [s], for the tare window
    *  @return Sensor-frame wrench for the admittance (zero while invalid or taring) */
@@ -262,6 +264,10 @@ private:
   Eigen::Vector<double, 6> inner_motion_;
   /** @brief First-cycle initialization flag for admittance state */
   bool admittance_initialized_;
+  /** @brief Seconds the admittance wrench has been zero (admittance.release_brake) */
+  double release_quiet_time_ = 0.0;
+  /** @brief True once the brake has acted for the current release (or before any push) */
+  bool release_braked_ = true;
   /** @brief Admittance virtual mass matrix (6x6 diagonal) */
   Eigen::Matrix<double, 6, 6> adm_mass_;
   /** @brief Inverse of admittance virtual mass matrix */
@@ -283,8 +289,17 @@ private:
   double payload_mass_ = 0.0;
   /** @brief Payload center of mass in the F/T sensor frame [m] */
   Eigen::Vector3d payload_com_ = Eigen::Vector3d::Zero();
+  /** @brief Payload weight force = this * gravity in the sensor frame (mass * I unless
+   *  ft_sensor.force_calibration.matrix is set), fixed at configure */
+  Eigen::Matrix3d payload_force_matrix_ = Eigen::Matrix3d::Zero();
+  /** @brief Index in params_.joints of ft_sensor.force_calibration.joint, -1 if none */
+  int ft_harmonics_joint_ = -1;
+  /** @brief ft_sensor.force_calibration.harmonics, one 3x2 [c s] block per harmonic */
+  std::vector<Eigen::Matrix<double, 3, 2>> ft_harmonics_;
   /** @brief Constant offset subtracted from the compensated wrench (software tare) */
   Eigen::Vector<double, 6> ft_tare_offset_ = Eigen::Vector<double, 6>::Zero();
+  /** @brief Last wrench handed to the admittance (sensor frame), for introspection */
+  Eigen::Vector<double, 6> ft_admittance_wrench_ = Eigen::Vector<double, 6>::Zero();
   /** @brief Running sum of the compensated wrench during the tare window */
   Eigen::Vector<double, 6> ft_tare_sum_ = Eigen::Vector<double, 6>::Zero();
   /** @brief Samples in ft_tare_sum_ */
@@ -329,6 +344,8 @@ private:
   Eigen::VectorXd fp2;
   /** @brief Friction parameters 3 of size nv */
   Eigen::VectorXd fp3;
+  /** @brief Coulomb friction per joint [Nm] (friction.coulomb), zero when not set */
+  Eigen::VectorXd friction_coulomb_;
 
   /** @brief Allowed type of joints */
   const std::unordered_set<std::basic_string<char>> allowed_joint_types = {
@@ -363,6 +380,8 @@ private:
   Eigen::VectorXd tau_nullspace;
   /** @brief Friction compensation torque */
   Eigen::VectorXd tau_friction;
+  /** @brief Joint velocity the friction model was evaluated at (see friction.source) */
+  Eigen::VectorXd dq_friction_;
   /** @brief Coriolis compensation torque */
   Eigen::VectorXd tau_coriolis;
   /** @brief Gravity compensation torque */

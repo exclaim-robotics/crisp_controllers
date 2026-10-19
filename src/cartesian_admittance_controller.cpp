@@ -229,6 +229,22 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
     ft_sensor_pose, ft_local, pinocchio::LOCAL, pinocchio::LOCAL_WORLD_ALIGNED, ft_world);
   Eigen::Vector<double, 6> ft_wrench_world = ft_world.toVector();
 
+  // 9b. Release brake: the wrench is exactly zero inside the deadzone, so zero for hold_off
+  // means the push has ended. Stop the target there instead of letting it coast for
+  // mass / damping, once per release so an admittance spring can still move it after.
+  if (params_.admittance.release_brake.enabled) {
+    if (ft_compensated.cwiseAbs().maxCoeff() > 0.0) {
+      release_quiet_time_ = 0.0;
+      release_braked_ = false;
+    } else {
+      release_quiet_time_ += period.seconds();
+      if (!release_braked_ && release_quiet_time_ >= params_.admittance.release_brake.hold_off) {
+        inner_motion_.setZero();
+        release_braked_ = true;
+      }
+    }
+  }
+
   // 10. Admittance dynamics: accel = M_inv * (F_ext - D * vel + K * error)
   // Spring term +K*(desired - inner) is a restoring force toward the desired pose
   Eigen::Matrix<double, 6, 6> K_adm = use_topic_adm_stiffness_ ? topic_adm_stiffness_ : adm_stiffness_;
@@ -247,6 +263,45 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
     inner_SE3_.translation() += inner_motion_.head(3) * dt;
     inner_SE3_.rotation() =
       (pinocchio::exp3(Eigen::Vector3d(inner_motion_.tail(3) * dt)) * inner_SE3_.rotation()).eval();
+  }
+
+  // 10b. Leash: keep the admittance target within max_lag of the end effector. Without it the
+  // target runs ahead of an arm that cannot follow (friction, error clipping) and, on release,
+  // the arm keeps travelling the whole lag to reach it. When it binds, the target is put back on
+  // the leash and its speed away from the arm capped at the arm's own speed along that line --
+  // not zeroed: the friction feedforward (friction.source target) reads this velocity, and must
+  // keep helping exactly while the arm lags. It never exceeds what the admittance asked for.
+  const pinocchio::Motion ee_velocity = pinocchio::getFrameVelocity(
+    model_, data_, end_effector_frame_id, pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED);
+  const auto leash = [](Eigen::Ref<Eigen::Vector3d> target_velocity, const Eigen::Vector3d & dir,
+                        const Eigen::Vector3d & arm_velocity) {
+    const double v_target = target_velocity.dot(dir);
+    const double v_cap = std::max(0.0, arm_velocity.dot(dir));
+    if (v_target > v_cap) {
+      target_velocity -= (v_target - v_cap) * dir;
+    }
+  };
+  if (params_.admittance.max_lag_position > 0.0) {
+    const Eigen::Vector3d lag = inner_SE3_.translation() - end_effector_pose.translation();
+    const double norm = lag.norm();
+    if (norm > params_.admittance.max_lag_position) {
+      const Eigen::Vector3d dir = lag / norm;
+      inner_SE3_.translation() =
+        end_effector_pose.translation() + dir * params_.admittance.max_lag_position;
+      leash(inner_motion_.head<3>(), dir, ee_velocity.linear());
+    }
+  }
+  if (params_.admittance.max_lag_rotation > 0.0) {
+    const Eigen::Vector3d lag =
+      pinocchio::log3(Eigen::Matrix3d(inner_SE3_.rotation() * end_effector_pose.rotation().transpose()));
+    const double norm = lag.norm();
+    if (norm > params_.admittance.max_lag_rotation) {
+      const Eigen::Vector3d dir = lag / norm;
+      inner_SE3_.rotation() =
+        pinocchio::exp3(Eigen::Vector3d(dir * params_.admittance.max_lag_rotation)) *
+        end_effector_pose.rotation();
+      leash(inner_motion_.tail<3>(), dir, ee_velocity.angular());
+    }
   }
 
   // 11. Use inner_SE3_ as the desired for impedance outer loop
@@ -324,8 +379,36 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
   tau_nullspace =
     tau_nullspace.cwiseMin(params_.nullspace.max_tau).cwiseMax(-params_.nullspace.max_tau);
 
-  tau_friction =
-    params_.use_friction ? get_friction(dq, fp1, fp2, fp3) : Eigen::VectorXd::Zero(model_.nv);
+  if (!params_.use_friction) {
+    tau_friction = Eigen::VectorXd::Zero(model_.nv);
+  } else if (params_.friction.source == "target" && !params_.coupled_se3_integration) {
+    // Feedforward: the joint velocity the admittance target asks for. inner_motion_ is the
+    // end-effector twist in world-aligned axes (decoupled integration above), so it is rotated
+    // into the end-effector frame when the Jacobian is the local one. The friction model
+    // saturates, so a large J_pinv near a singularity still gives a bounded torque.
+    Eigen::Vector<double, 6> target_twist = inner_motion_;
+    if (params_.use_local_jacobian) {
+      const Eigen::Matrix3d R_T = end_effector_pose.rotation().transpose();
+      target_twist.head<3>() = R_T * inner_motion_.head<3>();
+      target_twist.tail<3>() = R_T * inner_motion_.tail<3>();
+    }
+    dq_friction_ = J_pinv * target_twist;
+    // << copies into the existing buffer; plain = would move the returned vector in, and the
+    // address introspection registered for tau_friction would point at freed memory.
+    tau_friction << get_friction(dq_friction_, fp1, fp2, fp3);
+  } else {
+    if (params_.friction.source == "target") {
+      RCLCPP_WARN_ONCE(
+        get_node()->get_logger(),
+        "friction.source 'target' needs coupled_se3_integration false; using measured.");
+    }
+    dq_friction_ = dq;
+    tau_friction << get_friction(dq, fp1, fp2, fp3);
+  }
+  if (params_.use_friction) {
+    tau_friction += friction_coulomb_.cwiseProduct(
+      (dq_friction_ / params_.friction.velocity_threshold).array().tanh().matrix());
+  }
 
   if (params_.use_coriolis_compensation) {
     pinocchio::computeAllTerms(model_, data_, q_pin, dq);
@@ -345,9 +428,9 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
 
   // 16. Torque saturation and filtering
   if (params_.limit_torques) {
-    tau_d = saturateTorqueRate(tau_d, tau_previous, params_.max_delta_tau);
+    tau_d << saturateTorqueRate(tau_d, tau_previous, params_.max_delta_tau);  // see tau_friction
   }
-  tau_d = exponential_moving_average(tau_d, tau_previous, params_.filter.output_torque);
+  tau_d << exponential_moving_average(tau_d, tau_previous, params_.filter.output_torque);
 
   // 17. Command interfaces
   if (!params_.stop_commands) {
@@ -513,6 +596,46 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
       params_.ft_sensor.payload.from_model ? "robot model" : "parameters", payload_mass_,
       payload_com_.x(), payload_com_.y(), payload_com_.z(), params_.ft_sensor.tare_duration);
   }
+
+  // Force calibration: a full 3x3 weight matrix and joint-angle harmonics in place of
+  // mass * I. Checked here because the parameter library cannot express the sizes.
+  const auto & cal = params_.ft_sensor.force_calibration;
+  payload_force_matrix_ = payload_mass_ * Eigen::Matrix3d::Identity();
+  if (!cal.matrix.empty()) {
+    if (cal.matrix.size() != 9 || !params_.ft_sensor.payload_compensation) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "ft_sensor.force_calibration.matrix needs 9 values (has %zu) and payload_compensation.",
+        cal.matrix.size());
+      return CallbackReturn::ERROR;
+    }
+    payload_force_matrix_ = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(
+      cal.matrix.data());
+  }
+  ft_harmonics_joint_ = -1;
+  ft_harmonics_.clear();
+  if (!cal.joint.empty()) {
+    const auto it = std::find(params_.joints.begin(), params_.joints.end(), cal.joint);
+    if (it == params_.joints.end() || cal.harmonics.empty() || cal.harmonics.size() % 6 != 0) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "ft_sensor.force_calibration: joint '%s' must be one of joints, and harmonics a "
+        "non-empty multiple of 6 values (has %zu).", cal.joint.c_str(), cal.harmonics.size());
+      return CallbackReturn::ERROR;
+    }
+    ft_harmonics_joint_ = static_cast<int>(std::distance(params_.joints.begin(), it));
+    for (size_t k = 0; k < cal.harmonics.size(); k += 6) {
+      Eigen::Matrix<double, 3, 2> block;
+      block << cal.harmonics[k], cal.harmonics[k + 3],
+        cal.harmonics[k + 1], cal.harmonics[k + 4],
+        cal.harmonics[k + 2], cal.harmonics[k + 5];
+      ft_harmonics_.push_back(block);
+    }
+  }
+  if (!cal.matrix.empty() || ft_harmonics_joint_ >= 0) {
+    RCLCPP_INFO(get_node()->get_logger(),
+      "F/T force calibration: %s matrix, %zu harmonic(s) of %s",
+      cal.matrix.empty() ? "no" : "3x3", ft_harmonics_.size(),
+      ft_harmonics_joint_ >= 0 ? cal.joint.c_str() : "no joint");
+  }
   q = Eigen::VectorXd::Zero(model_.nv);
   q_pin = Eigen::VectorXd::Zero(model_.nq);
   dq = Eigen::VectorXd::Zero(model_.nv);
@@ -528,6 +651,16 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
   fp1 = Eigen::Map<Eigen::VectorXd>(params_.friction.fp1.data(), model_.nv);
   fp2 = Eigen::Map<Eigen::VectorXd>(params_.friction.fp2.data(), model_.nv);
   fp3 = Eigen::Map<Eigen::VectorXd>(params_.friction.fp3.data(), model_.nv);
+  friction_coulomb_ = Eigen::VectorXd::Zero(model_.nv);
+  if (!params_.friction.coulomb.empty()) {
+    if (params_.friction.coulomb.size() != static_cast<size_t>(model_.nv)) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+        "friction.coulomb has %zu values, expected one per joint (%d)",
+        params_.friction.coulomb.size(), model_.nv);
+      return CallbackReturn::ERROR;
+    }
+    friction_coulomb_ = Eigen::Map<Eigen::VectorXd>(params_.friction.coulomb.data(), model_.nv);
+  }
 
   nullspace_stiffness = Eigen::MatrixXd::Zero(model_.nv, model_.nv);
   nullspace_damping = Eigen::MatrixXd::Zero(model_.nv, model_.nv);
@@ -682,6 +815,7 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
   tau_secondary = Eigen::VectorXd::Zero(model_.nv);
   tau_nullspace = Eigen::VectorXd::Zero(model_.nv);
   tau_friction = Eigen::VectorXd::Zero(model_.nv);
+  dq_friction_ = Eigen::VectorXd::Zero(model_.nv);
   tau_coriolis = Eigen::VectorXd::Zero(model_.nv);
   tau_gravity = Eigen::VectorXd::Zero(model_.nv);
   tau_wrench = Eigen::VectorXd::Zero(model_.nv);
@@ -718,6 +852,14 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
     for (int i = 0; i < target_orientation_.coeffs().size(); ++i) {
       REGISTER_ROS2_CONTROL_INTROSPECTION(
         "target_orientation_" + std::to_string(i), &target_orientation_.coeffs()[i]);
+    }
+    for (int i = 0; i < model_.nv; ++i) {
+      REGISTER_ROS2_CONTROL_INTROSPECTION("tau_friction_" + std::to_string(i), &tau_friction[i]);
+      REGISTER_ROS2_CONTROL_INTROSPECTION("dq_friction_" + std::to_string(i), &dq_friction_[i]);
+    }
+    for (int i = 0; i < ft_admittance_wrench_.size(); ++i) {
+      REGISTER_ROS2_CONTROL_INTROSPECTION(
+        "ft_admittance_wrench_" + std::to_string(i), &ft_admittance_wrench_[i]);
     }
     for (int i = 0; i < q_target.size(); ++i) {
       REGISTER_ROS2_CONTROL_INTROSPECTION("q_target_" + std::to_string(i), &q_target[i]);
@@ -903,6 +1045,8 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
   // Reset admittance state so it reinitializes on first update cycle
   admittance_initialized_ = false;
   inner_motion_.setZero();
+  release_quiet_time_ = 0.0;
+  release_braked_ = true;
   ft_wrench_.setZero();
   ft_wrench_valid_ = false;
   reset_ft_tare_();
@@ -1030,10 +1174,19 @@ Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
   // The sensor reads the force the payload exerts ON it, which is its weight,
   // plus the torque of that weight about the sensor origin.
   if (payload_mass_ > 0.0) {
-    const Eigen::Vector3d f_weight =
-      payload_mass_ * (ft_sensor_rotation.transpose() * model_.gravity.linear());
-    wrench.head<3>() -= f_weight;
+    const Eigen::Vector3d g_sensor = ft_sensor_rotation.transpose() * model_.gravity.linear();
+    const Eigen::Vector3d f_weight = payload_mass_ * g_sensor;
+    // The force as the sensor reports it (force_calibration.matrix, mass * I if unset);
+    // the torque keeps the rigid weight about the com.
+    wrench.head<3>() -= payload_force_matrix_ * g_sensor;
     wrench.tail<3>() -= payload_com_.cross(f_weight);
+  }
+  if (ft_harmonics_joint_ >= 0) {
+    const double qj = q[ft_harmonics_joint_];
+    for (size_t k = 0; k < ft_harmonics_.size(); ++k) {
+      const double a = static_cast<double>(k + 1) * qj;
+      wrench.head<3>() -= ft_harmonics_[k] * Eigen::Vector2d(std::cos(a), std::sin(a));
+    }
   }
 
   if (!ft_tare_done_) {
@@ -1054,7 +1207,32 @@ Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
       ft_tare_offset_[3], ft_tare_offset_[4], ft_tare_offset_[5]);
   }
 
-  return wrench - ft_tare_offset_;
+  wrench -= ft_tare_offset_;
+
+  // Deadzones, force and torque separately: shrink the magnitude by the
+  // deadzone and keep the direction. Zero inside, continuous at the edge, and
+  // a push beyond it acts minus the deadzone. What they are for is the wrench
+  // of an untouched tool -- sensor drift since the tare and payload model
+  // error -- which with no admittance spring would move the target forever.
+  const auto shrink = [](Eigen::Ref<Eigen::Vector3d> v, double deadzone) {
+    const double norm = v.norm();
+    v *= norm > deadzone ? (norm - deadzone) / norm : 0.0;
+  };
+  shrink(wrench.head<3>(), params_.ft_sensor.deadzone_force);
+  shrink(wrench.tail<3>(), params_.ft_sensor.deadzone_torque);
+
+  // Ceilings, after the deadzone: the most a push can drive the admittance with, so a hard
+  // shove moves the target no faster than ceiling / damping. Magnitude capped, direction kept.
+  const auto cap = [](Eigen::Ref<Eigen::Vector3d> v, double ceiling) {
+    const double norm = v.norm();
+    if (ceiling > 0.0 && norm > ceiling) {
+      v *= ceiling / norm;
+    }
+  };
+  cap(wrench.head<3>(), params_.ft_sensor.max_force);
+  cap(wrench.tail<3>(), params_.ft_sensor.max_torque);
+  ft_admittance_wrench_ = wrench;
+  return wrench;
 }
 
 void CartesianAdmittanceController::reset_ft_tare_() {
