@@ -189,6 +189,14 @@ cartesian_admittance_controller:
     default_value: false
     description: "Add use_gravity_compensation. Double check that your robot is not already doing this behind the scenes (which is the case for Franka Robotics). In this case you should leave this parameter to false!"
 
+  gravity:
+    type: double_array
+    default_value: [0.0, 0.0, -9.81]
+    read_only: true
+    description: "Gravity [m/s^2] in the model's root frame (the URDF's root link), read at configure: the model's gravity, used by use_gravity_compensation and the F/T payload compensation. Pinocchio's default, [0, 0, -9.81], for a level base; a base standing tilted sees it turned."
+    validation:
+      fixed_size<>: [3]
+
   use_local_jacobian:
     type: bool
     default_value: false
