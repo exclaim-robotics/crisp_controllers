@@ -64,26 +64,6 @@ find_package(std_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 
 generate_parameter_library(
-  cartesian_controller_parameters
-  src/cartesian_controller.yaml
-)
-
-generate_parameter_library(
-  pose_broadcaster_parameters
-  src/pose_broadcaster.yaml
-)
-
-generate_parameter_library(
-  torque_feedback_controller_parameters
-  src/torque_feedback_controller.yaml
-)
-
-generate_parameter_library(
-  twist_broadcaster_parameters
-  src/twist_broadcaster.yaml
-)
-
-generate_parameter_library(
   cartesian_admittance_controller_parameters
   src/cartesian_admittance_controller.yaml
 )
@@ -91,11 +71,7 @@ generate_parameter_library(
 add_library(
         ${PROJECT_NAME}
         SHARED
-        src/cartesian_controller.cpp
         src/cartesian_admittance_controller.cpp
-        src/pose_broadcaster.cpp
-        src/torque_feedback_controller.cpp
-        src/twist_broadcaster.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -119,11 +95,7 @@ endif()
 # Link parameter libraries to the main library
 target_link_libraries(${PROJECT_NAME}
   PRIVATE
-    cartesian_controller_parameters
     cartesian_admittance_controller_parameters
-    pose_broadcaster_parameters
-    torque_feedback_controller_parameters
-    twist_broadcaster_parameters
 )
 
 
