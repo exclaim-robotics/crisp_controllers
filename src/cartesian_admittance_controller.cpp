@@ -1037,6 +1037,15 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
 
   end_effector_pose = data_.oMf[end_effector_frame_id];
 
+  // Start the output from the torque that holds the arm, not from zero:
+  // max_delta_tau and the output filter ramp from tau_previous, and from
+  // zero the arm fell for the ~0.1 s the ramp took to reach its weight
+  // (MuJoCo: 38 mm down, then ~7 mm left as the leash had dragged the
+  // admittance target along).
+  tau_previous = params_.use_gravity_compensation
+    ? Eigen::VectorXd(pinocchio::computeGeneralizedGravity(model_, data_, q_pin))
+    : Eigen::VectorXd::Zero(model_.nv);
+
   target_position_ = end_effector_pose.translation();
   target_orientation_ = Eigen::Quaterniond(end_effector_pose.rotation());
   desired_position_ = target_position_;
