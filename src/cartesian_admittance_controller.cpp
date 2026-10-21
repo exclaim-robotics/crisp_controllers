@@ -418,7 +418,7 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
   }
 
   tau_gravity = params_.use_gravity_compensation
-    ? pinocchio::computeGeneralizedGravity(model_, data_, q_pin)
+    ? Eigen::VectorXd(pinocchio::computeGeneralizedGravity(model_, data_, q_pin) + gravity_torque_offsets_)
     : Eigen::VectorXd::Zero(model_.nv);
 
   tau_wrench << J.transpose() * target_wrench_;
@@ -915,6 +915,12 @@ void CartesianAdmittanceController::setStiffnessAndDamping() {
   nullspace_stiffness.setZero();
   nullspace_damping.setZero();
 
+  // Here, so a change takes effect live like the stiffness (not looked up in update).
+  gravity_torque_offsets_ = Eigen::VectorXd::Zero(model_.nv);
+  for (size_t i = 0; i < params_.joints.size(); ++i) {
+    gravity_torque_offsets_[i] = params_.gravity_torque_offsets.joints_map.at(params_.joints.at(i)).value;
+  }
+
   auto weights = Eigen::VectorXd(model_.nv);
   for (size_t i = 0; i < params_.joints.size(); ++i) {
     weights[i] = params_.nullspace.weights.joints_map.at(params_.joints.at(i)).value;
@@ -1043,7 +1049,7 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
   // (MuJoCo: 38 mm down, then ~7 mm left as the leash had dragged the
   // admittance target along).
   tau_previous = params_.use_gravity_compensation
-    ? Eigen::VectorXd(pinocchio::computeGeneralizedGravity(model_, data_, q_pin))
+    ? Eigen::VectorXd(pinocchio::computeGeneralizedGravity(model_, data_, q_pin) + gravity_torque_offsets_)
     : Eigen::VectorXd::Zero(model_.nv);
 
   target_position_ = end_effector_pose.translation();

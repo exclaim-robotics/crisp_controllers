@@ -386,6 +386,8 @@ private:
   Eigen::VectorXd tau_coriolis;
   /** @brief Gravity compensation torque */
   Eigen::VectorXd tau_gravity;
+  /** @brief Added to tau_gravity: gravity_torque_offsets, in joint order */
+  Eigen::VectorXd gravity_torque_offsets_;
   /** @brief External wrench compensation torque */
   Eigen::VectorXd tau_wrench;
   /** @brief Final desired torque command */

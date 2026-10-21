@@ -179,6 +179,15 @@ cartesian_admittance_controller:
     default_value: false
     description: "Use friction compensation"
 
+  gravity_torque_offsets:
+    __map_joints:
+      value:
+        type: double
+        default_value: 0.0
+        description: "Nm per joint, added to the model's gravity torque (with use_gravity_compensation): what the model leaves out of each joint's static load, fitted per robot. 0 for every joint: unchanged."
+        validation:
+          bounds<>: [-5.0, 5.0]
+
   use_coriolis_compensation:
     type: bool
     default_value: false
