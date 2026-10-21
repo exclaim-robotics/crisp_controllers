@@ -525,6 +525,16 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
 
   Eigen::VectorXd q_locked = Eigen::VectorXd::Zero(raw_model_.nq);
   model_ = pinocchio::buildReducedModel(raw_model_, list_of_joints_to_lock_by_id, q_locked);
+  // Gravity as the base stands (a measured tilt), not always the root's -z.
+  const Eigen::Vector3d gravity(params_.gravity[0], params_.gravity[1], params_.gravity[2]);
+  if (!gravity.allFinite()) {
+    RCLCPP_ERROR(get_node()->get_logger(), "gravity must be finite");
+    return CallbackReturn::ERROR;
+  }
+  model_.gravity.linear(gravity);
+  RCLCPP_INFO(
+    get_node()->get_logger(), "gravity [%.4f, %.4f, %.4f] m/s^2 in the model's root frame",
+    gravity.x(), gravity.y(), gravity.z());
   data_ = pinocchio::Data(model_);
 
   for (int joint_id = 0; joint_id < model_.njoints; joint_id++) {
