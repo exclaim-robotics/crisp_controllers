@@ -179,15 +179,6 @@ cartesian_admittance_controller:
     default_value: false
     description: "Use friction compensation"
 
-  gravity_torque_offsets:
-    __map_joints:
-      value:
-        type: double
-        default_value: 0.0
-        description: "Nm per joint, added to the model's gravity torque (with use_gravity_compensation): what the model leaves out of each joint's static load, fitted per robot. 0 for every joint: unchanged."
-        validation:
-          bounds<>: [-5.0, 5.0]
-
   use_coriolis_compensation:
     type: bool
     default_value: false
@@ -328,12 +319,6 @@ cartesian_admittance_controller:
     description: "If set to true, we will stop sending commands to the robot. This is mainly for debugging useful."
 
   friction:
-    source:
-      type: string
-      default_value: "measured"
-      description: "Joint velocity the friction model is evaluated at. measured: the joints' own velocity (feedback; zero for a joint that is stuck, so no help breaking it loose). target: the admittance target's velocity mapped to the joints through the Jacobian pseudo-inverse (feedforward; helps a joint in the direction it is about to move, and is zero while the target is still). target needs the default decoupled integration (coupled_se3_integration false), and falls back to measured otherwise."
-      validation:
-        one_of<>: [["measured", "target"]]
     fp1:
       type: double_array
       default_value: [0.54615, 0.87224, 0.64068, 1.2794, 0.83904, 0.30301, 0.56489]
@@ -346,16 +331,6 @@ cartesian_admittance_controller:
       type: double_array
       default_value: [ 0.039533, 0.025882, -0.04607, 0.036194, 0.026226, -0.021047, 0.0035526]
       description: "Friction parameters part 3"
-    coulomb:
-      type: double_array
-      default_value: []
-      description: "Optional Coulomb term per joint [Nm], added to the fp1-fp3 model: coulomb * tanh(dq / velocity_threshold), at the same joint velocity (see source). Covers the static/breakaway friction the smooth fp model barely reaches at low speed. Empty = none; otherwise one value per joint. Meant for source 'target': on the measured velocity a sharp term chatters as a stuck joint jitters around zero."
-    velocity_threshold:
-      type: double
-      default_value: 0.02
-      description: "Joint velocity [rad/s] over which the Coulomb term ramps in (tanh scale): 76% of it at this velocity."
-      validation:
-        gt<>: [0.0]
 
   variable_max_impedance_stiffness:
     translational:
@@ -387,29 +362,6 @@ cartesian_admittance_controller:
     description: "Whether or not to enable introspection for this controller. This will allow us to visualize the internal state of the controller in plotjuggler using the introspection topics."
 
   admittance:
-    max_lag_position:
-      type: double
-      default_value: 0.0
-      description: "Leash [m]: the admittance target is kept within this distance of the end effector, and its velocity away from it removed. Bounds how far the arm travels after a push is released (it catches up with the target) and stops a hard push winding the target up far ahead of an arm that cannot follow. While it binds, the target's speed away from the arm is capped at the arm's own speed (not zeroed), so friction.source target keeps compensating at the speed the arm actually moves. 0 disables. Pair with task.error_clip of the same size and a stiffness that still gives enough pull at that lag."
-      validation:
-        gt_eq<>: [0.0]
-    max_lag_rotation:
-      type: double
-      default_value: 0.0
-      description: "Leash [rad], as max_lag_position for the orientation. 0 disables."
-      validation:
-        gt_eq<>: [0.0]
-    release_brake:
-      enabled:
-        type: bool
-        default_value: false
-        description: "Stop the admittance target the moment a push is released: once the F/T wrench handed to the admittance (after deadzone) has been zero for release_brake.hold_off, its velocity is set to zero, once per release. Removes the coast (mass / damping) and with it the friction feedforward that follows the target; the arm still closes the gap to the target, at most the leash. An admittance spring moves the target as usual afterwards."
-      hold_off:
-        type: double
-        default_value: 0.02
-        description: "Seconds the wrench must stay zero before the brake acts, so a push hovering at the deadzone edge does not stop the target every few cycles."
-        validation:
-          gt_eq<>: [0.0]
     mass_x:
       type: double
       default_value: 1.0
@@ -520,10 +472,6 @@ cartesian_admittance_controller:
         bounds<>: [0.0, 5000.0]
 
   ft_sensor:
-    name:
-      type: string
-      default_value: ""
-      description: "Name of the F/T sensor component exporting <name>/force.{x,y,z} and <name>/torque.{x,y,z} state interfaces. If set, the wrench is read from these state interfaces and ft_sensor.topic is ignored. If empty, the wrench is read from ft_sensor.topic."
     topic:
       type: string
       default_value: "ft_sensor_wrench"
@@ -532,70 +480,6 @@ cartesian_admittance_controller:
       type: string
       default_value: ""
       description: "Name of the F/T sensor measurement frame in the URDF. If empty, defaults to end_effector_frame (legacy behavior)."
-    payload_compensation:
-      type: bool
-      default_value: false
-      description: "Subtract the payload's weight (everything mounted after ft_sensor.frame) from the measured wrench, using the sensor orientation from the robot model, so it is not taken for an external push. Gravity is the robot model's."
-    payload:
-      from_model:
-        type: bool
-        default_value: true
-        description: "Take the payload mass and center of mass from the robot description: every link after ft_sensor.frame, including that link and any joints below it (held at their neutral position). If false, use ft_sensor.payload.mass and ft_sensor.payload.com."
-      mass:
-        type: double
-        default_value: 0.0
-        description: "Payload mass [kg], used when ft_sensor.payload.from_model is false."
-        validation:
-          gt_eq<>: [0.0]
-      com:
-        type: double_array
-        default_value: [0.0, 0.0, 0.0]
-        description: "Payload center of mass [m] in ft_sensor.frame, used when ft_sensor.payload.from_model is false."
-        validation:
-          fixed_size<>: [3]
-    force_calibration:
-      matrix:
-        type: double_array
-        default_value: []
-        description: "Empty, or 9 values (row-major 3x3, kg): the payload's weight FORCE as the sensor reports it is matrix * g, g being gravity in ft_sensor.frame [m/s^2], in place of payload mass * g. Fitted from still poses, it takes in the sensor's gain and cross-axis errors and a misalignment between its axes and ft_sensor.frame. The weight's torque still uses payload mass and com. Needs payload_compensation."
-      joint:
-        type: string
-        default_value: ""
-        description: "Joint whose angle q the harmonics below depend on (one of joints). Empty disables them."
-      harmonics:
-        type: double_array
-        default_value: []
-        description: "6 values per harmonic k = 1, 2, ...: [cx, cy, cz, sx, sy, sz] [N]. c_k cos(k q) + s_k sin(k q) is subtracted from the measured force in ft_sensor.frame: a force on the sensor that depends on that joint's angle and not on gravity."
-    tare_duration:
-      type: double
-      default_value: 0.0
-      description: "Seconds over which the (payload-compensated) wrench is averaged after activation and then subtracted as a constant offset. Removes sensor bias, and the weight a sensor driver tared away at its own start-up. The admittance sees zero wrench during this window, so keep the robot untouched. 0 disables the software tare."
-      validation:
-        gt_eq<>: [0.0]
-    deadzone_force:
-      type: double
-      default_value: 0.0
-      description: "Force deadzone [N], applied after payload compensation and tare: the force magnitude is reduced by this much (direction kept), so smaller forces are ignored and the output is continuous at the edge. Covers sensor drift since the tare and payload model error, which would otherwise drive the admittance target forever when its stiffness is zero. 0 disables."
-      validation:
-        gt_eq<>: [0.0]
-    deadzone_torque:
-      type: double
-      default_value: 0.0
-      description: "Torque deadzone [Nm], as deadzone_force for the torque. 0 disables."
-      validation:
-        gt_eq<>: [0.0]
-    max_force:
-      type: double
-      default_value: 0.0
-      description: "Ceiling [N] on the force driving the admittance, after the deadzone: larger pushes are capped (direction kept), so the target moves at most max_force / admittance damping. 0 disables."
-      validation:
-        gt_eq<>: [0.0]
-    max_torque:
-      type: double
-      default_value: 0.0
-      description: "Ceiling [Nm], as max_force for the torque. 0 disables."
-      validation:
-        gt_eq<>: [0.0]
 
   variable_max_admittance_stiffness:
     translational:
