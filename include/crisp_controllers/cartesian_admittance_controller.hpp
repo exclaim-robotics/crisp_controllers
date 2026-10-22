@@ -168,6 +168,20 @@ private:
   void parse_ft_sensor_();
 
   /**
+   * @brief Reads the F/T sensor data from the hardware interface (ft_sensor.name)
+   */
+  void read_ft_sensor_state_();
+
+  /**
+   * @brief Removes the payload weight and the sensor bias from the F/T reading
+   * @param ft_sensor_rotation Rotation of the F/T sensor frame in the world frame
+   * @param dt Control period [s], for the bias estimation window
+   * @return External wrench in the sensor frame (zero while invalid or estimating the bias)
+   */
+  Eigen::Vector<double, 6> compensate_ft_wrench_(
+    const Eigen::Matrix3d & ft_sensor_rotation, double dt);
+
+  /**
    * @brief Reads the target admittance stiffness from the realtime buffer
    */
   void parse_target_adm_stiffness_();
@@ -261,6 +275,24 @@ private:
   Eigen::Matrix<double, 6, 6> adm_damping_;
   /** @brief F/T sensor reading (6D wrench) */
   Eigen::VectorXd ft_wrench_;
+  /** @brief True once ft_wrench_ holds a finite measurement */
+  bool ft_wrench_valid_ = false;
+  /** @brief F/T sensor component read from the state interfaces, fixed at configure (empty: topic) */
+  std::string ft_state_sensor_name_;
+  /** @brief Payload mass after the F/T sensor [kg] */
+  double payload_mass_ = 0.0;
+  /** @brief Payload center of mass in the F/T sensor frame [m] */
+  Eigen::Vector3d payload_com_ = Eigen::Vector3d::Zero();
+  /** @brief Sensor bias subtracted from the payload-compensated wrench */
+  Eigen::Vector<double, 6> ft_bias_ = Eigen::Vector<double, 6>::Zero();
+  /** @brief Sum of the payload-compensated wrench over the bias window */
+  Eigen::Vector<double, 6> ft_bias_sum_ = Eigen::Vector<double, 6>::Zero();
+  /** @brief Samples in ft_bias_sum_ */
+  size_t ft_bias_count_ = 0;
+  /** @brief Time elapsed in the bias window [s] */
+  double ft_bias_elapsed_ = 0.0;
+  /** @brief True once the bias is estimated (or its estimation is disabled) */
+  bool ft_bias_done_ = true;
   /** @brief Topic-provided admittance stiffness (6x6 diagonal) */
   Eigen::Matrix<double, 6, 6> topic_adm_stiffness_;
 

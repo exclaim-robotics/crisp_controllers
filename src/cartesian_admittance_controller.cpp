@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 #include <Eigen/src/Core/Matrix.h>  // NOLINT(build/include_order)
 #include <fmt/format.h>
@@ -61,6 +62,12 @@ CartesianAdmittanceController::state_interface_configuration() const {
   for (const auto & joint_name : params_.joints) {
     config.names.push_back(joint_name + "/velocity");
   }
+  // F/T sensor after the joints, so the joint indexing in updateCurrentState() holds
+  if (!ft_state_sensor_name_.empty()) {
+    for (const auto * axis : {"force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"}) {
+      config.names.push_back(ft_state_sensor_name_ + "/" + axis);
+    }
+  }
   return config;
 }
 
@@ -89,8 +96,10 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
     setStiffnessAndDamping();
   }
 
-  // 3. Parse F/T sensor data
-  if (new_ft_sensor_) {
+  // 3. Parse F/T sensor data (hardware interface if ft_sensor.name is set, topic otherwise)
+  if (!ft_state_sensor_name_.empty()) {
+    read_ft_sensor_state_();
+  } else if (new_ft_sensor_) {
     parse_ft_sensor_();
     new_ft_sensor_ = false;
   }
@@ -156,9 +165,12 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
   Eigen::Vector<double, 6> adm_error;
   adm_error << adm_pos_error, adm_rot_error;
 
-  // 9. Transform F/T wrench from sensor (LOCAL) frame to LOCAL_WORLD_ALIGNED frame
+  // 9. Remove payload weight and sensor bias, then transform F/T wrench from sensor (LOCAL)
+  // frame to LOCAL_WORLD_ALIGNED frame
   pinocchio::SE3 ft_sensor_pose = data_.oMf[ft_sensor_frame_id];
-  pinocchio::Force ft_local(ft_wrench_.head(3), ft_wrench_.tail(3));
+  const Eigen::Vector<double, 6> ft_external =
+    compensate_ft_wrench_(ft_sensor_pose.rotation(), period.seconds());
+  pinocchio::Force ft_local(ft_external.head<3>(), ft_external.tail<3>());
   pinocchio::Force ft_world = pinocchio::Force::Zero();
   pinocchio::changeReferenceFrame(
     ft_sensor_pose, ft_local, pinocchio::LOCAL, pinocchio::LOCAL_WORLD_ALIGNED, ft_world);
@@ -426,7 +438,14 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
       params_.ft_sensor.frame.c_str(),
       ft_sensor_frame_id);
   }
-  q = Eigen::VectorXd::Zero(model_.nv);
+  payload_mass_ = params_.ft_sensor.payload.mass;
+  payload_com_ << params_.ft_sensor.payload.com[0], params_.ft_sensor.payload.com[1],
+    params_.ft_sensor.payload.com[2];
+  RCLCPP_INFO(get_node()->get_logger(),
+    "F/T payload: mass %.4f kg, com [%.5f, %.5f, %.5f] m; bias estimated over %.2f s",
+    payload_mass_, payload_com_.x(), payload_com_.y(), payload_com_.z(),
+    params_.ft_sensor.bias.duration);
+  q =Eigen::VectorXd::Zero(model_.nv);
   q_pin = Eigen::VectorXd::Zero(model_.nq);
   dq = Eigen::VectorXd::Zero(model_.nv);
   q_ref = Eigen::VectorXd::Zero(model_.nv);
@@ -554,18 +573,25 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
 
   // --- Admittance-specific subscriptions ---
 
-  // F/T sensor subscription
-  auto ft_sensor_callback =
-    [this](const std::shared_ptr<geometry_msgs::msg::WrenchStamped> msg) -> void {
-    ft_sensor_buffer_.writeFromNonRT(msg);
-    new_ft_sensor_ = true;
-  };
+  // F/T sensor: hardware interface if ft_sensor.name is set, topic subscription otherwise
+  ft_state_sensor_name_ = params_.ft_sensor.name;
+  ft_sensor_sub_.reset();
+  if (!ft_state_sensor_name_.empty()) {
+    RCLCPP_INFO(get_node()->get_logger(), "F/T sensor read from state interfaces: %s/{force,torque}.*",
+      ft_state_sensor_name_.c_str());
+  } else {
+    auto ft_sensor_callback =
+      [this](const std::shared_ptr<geometry_msgs::msg::WrenchStamped> msg) -> void {
+      ft_sensor_buffer_.writeFromNonRT(msg);
+      new_ft_sensor_ = true;
+    };
 
-  ft_sensor_sub_ = get_node()->create_subscription<geometry_msgs::msg::WrenchStamped>(
-    params_.ft_sensor.topic, rclcpp::SensorDataQoS(), ft_sensor_callback);
+    ft_sensor_sub_ = get_node()->create_subscription<geometry_msgs::msg::WrenchStamped>(
+      params_.ft_sensor.topic, rclcpp::SensorDataQoS(), ft_sensor_callback);
 
-  RCLCPP_INFO(get_node()->get_logger(), "F/T sensor subscription on topic: %s",
-    params_.ft_sensor.topic.c_str());
+    RCLCPP_INFO(get_node()->get_logger(), "F/T sensor subscription on topic: %s",
+      params_.ft_sensor.topic.c_str());
+  }
 
   // Variable admittance stiffness subscription
   if (params_.variable_admittance_stiffness.enabled) {
@@ -776,6 +802,22 @@ void CartesianAdmittanceController::updateCurrentState(bool initialize) {
 CallbackReturn
 CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*previous_state*/) {
 
+  // read_ft_sensor_state_() indexes the F/T interfaces by position; check their names once
+  if (!ft_state_sensor_name_.empty()) {
+    const size_t offset = 2 * params_.joints.size();
+    size_t i = 0;
+    for (const auto * axis : {"force.x", "force.y", "force.z", "torque.x", "torque.y", "torque.z"}) {
+      const std::string expected = ft_state_sensor_name_ + "/" + axis;
+      if (offset + i >= state_interfaces_.size() ||
+          state_interfaces_[offset + i].get_name() != expected) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+          "Expected state interface '%s' at index %zu.", expected.c_str(), offset + i);
+        return CallbackReturn::ERROR;
+      }
+      ++i;
+    }
+  }
+
   // Update the current state with initial measurements (no EMA filtering)
   updateCurrentState(true);
 
@@ -793,6 +835,14 @@ CartesianAdmittanceController::on_activate(const rclcpp_lifecycle::State & /*pre
   admittance_initialized_ = false;
   inner_motion_.setZero();
   ft_wrench_.setZero();
+  ft_wrench_valid_ = false;
+
+  // Re-estimate the bias on every activation: the sensor drifts, and its driver may tare
+  ft_bias_.setZero();
+  ft_bias_sum_.setZero();
+  ft_bias_count_ = 0;
+  ft_bias_elapsed_ = 0.0;
+  ft_bias_done_ = params_.ft_sensor.bias.duration <= 0.0;
 
   RCLCPP_INFO(get_node()->get_logger(), "Admittance controller activated.");
   return CallbackReturn::SUCCESS;
@@ -875,6 +925,65 @@ void CartesianAdmittanceController::parse_ft_sensor_() {
   auto msg = *ft_sensor_buffer_.readFromRT();
   ft_wrench_ << msg->wrench.force.x, msg->wrench.force.y, msg->wrench.force.z,
     msg->wrench.torque.x, msg->wrench.torque.y, msg->wrench.torque.z;
+  ft_wrench_valid_ = ft_wrench_.allFinite();
+}
+
+void CartesianAdmittanceController::read_ft_sensor_state_() {
+  // The F/T interfaces follow the joint positions and velocities
+  const size_t offset = 2 * params_.joints.size();
+  for (size_t i = 0; i < 6; ++i) {
+#if ROS2_VERSION_ABOVE_HUMBLE
+    const double value =
+      state_interfaces_[offset + i].get_optional().value_or(std::numeric_limits<double>::quiet_NaN());
+#else
+    const double value = state_interfaces_[offset + i].get_value();
+#endif
+    if (!std::isfinite(value)) {
+      // Sensor not streaming yet or dropped out: no external wrench rather than a stale one
+      ft_wrench_valid_ = false;
+      RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+        "No finite value on %s; ignoring the F/T sensor.",
+        state_interfaces_[offset + i].get_name().c_str());
+      return;
+    }
+    ft_wrench_[i] = value;
+  }
+  ft_wrench_valid_ = true;
+}
+
+Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
+  const Eigen::Matrix3d & ft_sensor_rotation, double dt) {
+  if (!ft_wrench_valid_) {
+    return Eigen::Vector<double, 6>::Zero();
+  }
+  Eigen::Vector<double, 6> wrench = ft_wrench_;
+
+  // The payload pulls on the sensor with its weight, applied at its center of mass
+  if (payload_mass_ > 0.0) {
+    const Eigen::Vector3d weight =
+      payload_mass_ * (ft_sensor_rotation.transpose() * model_.gravity.linear());
+    wrench.head<3>() -= weight;
+    wrench.tail<3>() -= payload_com_.cross(weight);
+  }
+
+  if (!ft_bias_done_) {
+    // What is left at rest is the sensor bias; hold the admittance still meanwhile
+    ft_bias_sum_ += wrench;
+    ++ft_bias_count_;
+    ft_bias_elapsed_ += dt;
+    if (ft_bias_elapsed_ < params_.ft_sensor.bias.duration) {
+      return Eigen::Vector<double, 6>::Zero();
+    }
+    ft_bias_ = ft_bias_sum_ / static_cast<double>(ft_bias_count_);
+    ft_bias_done_ = true;
+    RCLCPP_INFO(get_node()->get_logger(),
+      "F/T bias over %.2f s (%zu samples): force [%.3f, %.3f, %.3f] N, "
+      "torque [%.4f, %.4f, %.4f] Nm",
+      ft_bias_elapsed_, ft_bias_count_, ft_bias_[0], ft_bias_[1], ft_bias_[2],
+      ft_bias_[3], ft_bias_[4], ft_bias_[5]);
+  }
+
+  return wrench - ft_bias_;
 }
 
 void CartesianAdmittanceController::parse_target_adm_stiffness_() {

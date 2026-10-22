@@ -472,6 +472,10 @@ cartesian_admittance_controller:
         bounds<>: [0.0, 5000.0]
 
   ft_sensor:
+    name:
+      type: string
+      default_value: ""
+      description: "F/T sensor component in the hardware interface. If set, the wrench is read from its <name>/force.{x,y,z} and <name>/torque.{x,y,z} state interfaces and ft_sensor.topic is ignored. If empty, the wrench comes from ft_sensor.topic."
     topic:
       type: string
       default_value: "ft_sensor_wrench"
@@ -480,6 +484,26 @@ cartesian_admittance_controller:
       type: string
       default_value: ""
       description: "Name of the F/T sensor measurement frame in the URDF. If empty, defaults to end_effector_frame (legacy behavior)."
+    payload:
+      mass:
+        type: double
+        default_value: 0.0
+        description: "Mass [kg] of everything mounted after ft_sensor.frame. Its weight, at the sensor orientation given by the robot model, is subtracted from the measured wrench. 0 disables the payload compensation."
+        validation:
+          gt_eq<>: [0.0]
+      com:
+        type: double_array
+        default_value: [0.0, 0.0, 0.0]
+        description: "Center of mass [m] of the payload in ft_sensor.frame."
+        validation:
+          fixed_size<>: [3]
+    bias:
+      duration:
+        type: double
+        default_value: 0.0
+        description: "Seconds, after activation, over which the payload-compensated wrench is averaged into the sensor bias, which is then subtracted from every reading. The admittance sees no external wrench meanwhile, so do not touch the robot. 0 disables the bias estimation."
+        validation:
+          gt_eq<>: [0.0]
 
   variable_max_admittance_stiffness:
     translational:
