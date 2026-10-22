@@ -170,6 +170,7 @@ CartesianAdmittanceController::update(const rclcpp::Time & time, const rclcpp::D
   pinocchio::SE3 ft_sensor_pose = data_.oMf[ft_sensor_frame_id];
   const Eigen::Vector<double, 6> ft_external =
     compensate_ft_wrench_(ft_sensor_pose.rotation(), period.seconds());
+  publish_ft_compensated_(time, ft_external);
   pinocchio::Force ft_local(ft_external.head<3>(), ft_external.tail<3>());
   pinocchio::Force ft_world = pinocchio::Force::Zero();
   pinocchio::changeReferenceFrame(
@@ -445,7 +446,7 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
     "F/T payload: mass %.4f kg, com [%.5f, %.5f, %.5f] m; bias estimated over %.2f s",
     payload_mass_, payload_com_.x(), payload_com_.y(), payload_com_.z(),
     params_.ft_sensor.bias.duration);
-  q =Eigen::VectorXd::Zero(model_.nv);
+  q = Eigen::VectorXd::Zero(model_.nv);
   q_pin = Eigen::VectorXd::Zero(model_.nq);
   dq = Eigen::VectorXd::Zero(model_.nv);
   q_ref = Eigen::VectorXd::Zero(model_.nv);
@@ -591,6 +592,21 @@ CartesianAdmittanceController::on_configure(const rclcpp_lifecycle::State & /*pr
 
     RCLCPP_INFO(get_node()->get_logger(), "F/T sensor subscription on topic: %s",
       params_.ft_sensor.topic.c_str());
+  }
+
+  // Debug: the wrench the admittance acts on, after payload and bias compensation
+  ft_compensated_publisher_.reset();
+  realtime_ft_compensated_publisher_.reset();
+  if (!params_.ft_sensor.compensated_topic.empty()) {
+    ft_compensated_msg_ = geometry_msgs::msg::WrenchStamped();
+    ft_compensated_msg_.header.frame_id = model_.frames[ft_sensor_frame_id].name;
+    ft_compensated_publisher_ = get_node()->create_publisher<geometry_msgs::msg::WrenchStamped>(
+      params_.ft_sensor.compensated_topic, rclcpp::SensorDataQoS());
+    realtime_ft_compensated_publisher_ =
+      std::make_shared<realtime_tools::RealtimePublisher<geometry_msgs::msg::WrenchStamped>>(
+        ft_compensated_publisher_);
+    RCLCPP_INFO(get_node()->get_logger(), "Compensated F/T wrench published on: %s",
+      ft_compensated_publisher_->get_topic_name());
   }
 
   // Variable admittance stiffness subscription
@@ -984,6 +1000,28 @@ Eigen::Vector<double, 6> CartesianAdmittanceController::compensate_ft_wrench_(
   }
 
   return wrench - ft_bias_;
+}
+
+void CartesianAdmittanceController::publish_ft_compensated_(
+  const rclcpp::Time & time, const Eigen::Vector<double, 6> & wrench) {
+  if (!realtime_ft_compensated_publisher_) {
+    return;
+  }
+  ft_compensated_msg_.header.stamp = time;
+  ft_compensated_msg_.wrench.force.x = wrench[0];
+  ft_compensated_msg_.wrench.force.y = wrench[1];
+  ft_compensated_msg_.wrench.force.z = wrench[2];
+  ft_compensated_msg_.wrench.torque.x = wrench[3];
+  ft_compensated_msg_.wrench.torque.y = wrench[4];
+  ft_compensated_msg_.wrench.torque.z = wrench[5];
+#if REALTIME_TOOLS_NEW_API
+  realtime_ft_compensated_publisher_->try_publish(ft_compensated_msg_);
+#else
+  if (realtime_ft_compensated_publisher_->trylock()) {
+    realtime_ft_compensated_publisher_->msg_ = ft_compensated_msg_;
+    realtime_ft_compensated_publisher_->unlockAndPublish();
+  }
+#endif
 }
 
 void CartesianAdmittanceController::parse_target_adm_stiffness_() {

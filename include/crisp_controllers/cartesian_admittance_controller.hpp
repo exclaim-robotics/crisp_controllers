@@ -35,6 +35,7 @@
 
 #include <sensor_msgs/msg/joint_state.hpp>
 #include "realtime_tools/realtime_buffer.hpp"
+#include "realtime_tools/realtime_publisher.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
@@ -182,6 +183,13 @@ private:
     const Eigen::Matrix3d & ft_sensor_rotation, double dt);
 
   /**
+   * @brief Publishes the compensated F/T wrench on ft_sensor.compensated_topic, if set
+   * @param time Control cycle time, for the stamp
+   * @param wrench External wrench in the sensor frame, as compensate_ft_wrench_() returns it
+   */
+  void publish_ft_compensated_(const rclcpp::Time & time, const Eigen::Vector<double, 6> & wrench);
+
+  /**
    * @brief Reads the target admittance stiffness from the realtime buffer
    */
   void parse_target_adm_stiffness_();
@@ -293,6 +301,12 @@ private:
   double ft_bias_elapsed_ = 0.0;
   /** @brief True once the bias is estimated (or its estimation is disabled) */
   bool ft_bias_done_ = true;
+  /** @brief Publishes the compensated F/T wrench (ft_sensor.compensated_topic; null: disabled) */
+  rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr ft_compensated_publisher_;
+  std::shared_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::WrenchStamped>>
+    realtime_ft_compensated_publisher_;
+  /** @brief The compensated wrench message, its frame_id set at configure */
+  geometry_msgs::msg::WrenchStamped ft_compensated_msg_;
   /** @brief Topic-provided admittance stiffness (6x6 diagonal) */
   Eigen::Matrix<double, 6, 6> topic_adm_stiffness_;
 

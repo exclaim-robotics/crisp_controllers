@@ -497,6 +497,11 @@ cartesian_admittance_controller:
         description: "Center of mass [m] of the payload in ft_sensor.frame."
         validation:
           fixed_size<>: [3]
+    compensated_topic:
+      type: string
+      default_value: "~/ft_compensated_wrench"
+      description: "Debug topic (geometry_msgs/WrenchStamped, ft_sensor.frame) with the wrench the admittance acts on: the measurement minus the payload weight and the bias, zero while the bias is estimated or the reading is invalid. Published every control cycle. Empty disables it."
+      read_only: true
     bias:
       duration:
         type: double
