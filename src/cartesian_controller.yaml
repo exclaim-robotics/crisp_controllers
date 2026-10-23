@@ -339,7 +339,7 @@ cartesian_controller:
       default_value: 60.0
       description: "Maximum allowed rotational stiffness value. Stiffness values above this will be clamped."
       validation:
-        bounds<>: [0.0, 100.0]
+        bounds<>: [0.0, 1000.0]
 
   variable_stiffness:
     enabled:
