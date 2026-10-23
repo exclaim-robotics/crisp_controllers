@@ -613,6 +613,15 @@ CartesianController::on_activate(const rclcpp_lifecycle::State & /*previous_stat
   desired_position_ = target_position_;
   desired_orientation_ = target_orientation_;
 
+  // Start the output from the torque that holds the arm, not from zero:
+  // max_delta_tau and the output filter ramp from tau_previous, and from
+  // zero the arm fell for the ~0.1 s the ramp took to reach its weight, then
+  // rang (MuJoCo: joint_5 swung 5 deg, 6 s to settle). Also not from the
+  // last activation's torque, which held another pose.
+  tau_previous = params_.use_gravity_compensation
+    ? Eigen::VectorXd(pinocchio::computeGeneralizedGravity(model_, data_, q_pin))
+    : Eigen::VectorXd::Zero(model_.nv);
+
   RCLCPP_INFO(get_node()->get_logger(), "Controller activated.");
   return CallbackReturn::SUCCESS;
 }
